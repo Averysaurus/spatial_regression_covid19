@@ -1,0 +1,231 @@
+---
+title: "272C_final_project"
+author: "Avery_Richards"
+date: "4/21/2021"
+output:
+   prettydoc::html_pretty:
+    theme: hpstr
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F)
+```
+
+```{r}
+# load and install packages
+pacman::p_load(
+  sp, ggplot2, raster, tidyverse, rgdal,
+  spdep, leaflet, spaMM, viridis, spatstat, plotrix, hrbrthemes,
+  fields, maptools, RColorBrewer, lattice, geoR, kableExtra,
+  car, splancs, smacpod, modelr, cartography, caret) 
+
+# disable scientific notation
+options(scipen = 99)
+```
+
+
+```{r}
+
+# import data
+cov_usa <-  rgdal::readOGR('usa_adm1_covid.geojson')
+health_data <- read_csv("health_covariates.csv")
+
+# merge datasets
+cov_usa_sp <- merge(cov_usa, 
+                    health_data, 
+                    by = 'NAME_1')
+
+# normalize mortality with population
+cov_usa_sp$death_per_10000 <- 
+  (cov_usa_sp$Deaths / cov_usa_sp$population_2019) * 10000
+
+
+```
+
+
+
+```{r}
+
+# adjacency matrix neighborhood for state polygons.
+cov_usa_nb <- poly2nb(cov_usa_sp, queen = T) 
+# extract coordinates. 
+coords_cov <- coordinates(cov_usa_sp)
+
+# plot to evaluate 
+raster::plot(cov_usa_sp, xlab = "Queen Neighbor Conitiguity Structure, Unites States")
+raster::plot(cov_usa_nb, coords_cov, col="orange",add=T, )
+```
+
+```{r}
+
+#set weights matrix
+cov_usa_w <- nb2listw(cov_usa_nb)
+cov_usa_w
+
+# global moran test.
+moran.test(cov_usa_sp$death_per_10000, listw = cov_usa_w)
+
+```
+
+```{r}
+
+# round to integer for poisson count regression
+cov_usa_sp$death_per_10000 <- round(cov_usa_sp$death_per_10000)
+
+# regression modelling, evaluate and print coefficients. 
+mod_2_test <- glm(death_per_10000 ~ diabetes_ratio + asthma_ratio, 
+                    data = cov_usa_sp, family = 'poisson')
+
+mod2_summary <- summary(mod_2_test)
+mod2_coefs <- as.data.frame(mod2_summary$coefficients)
+
+mod_2B_test <- glm(death_per_10000 ~ diabetes_ratio, 
+                   data = cov_usa_sp, family = 'poisson')
+
+mod2b_summary <- summary(mod_2B_test)
+mod2b_coefs <- as.data.frame(mod2b_summary$coefficients)
+
+
+table1 <- kbl(mod2_coefs) %>% 
+    kable_paper("hover", full_width = F)
+
+table2 <- kbl(mod2b_coefs) %>% 
+    kable_paper("hover", full_width = F)
+
+table1
+table2
+```
+
+
+```{r}
+
+# stepwise evaulation of spatial regression model, with and without interaction terms. 
+
+usa_adj_matrix <- nb2mat(cov_usa_nb, style="B")
+row.names(usa_adj_matrix) <- 
+  colnames(usa_adj_matrix) <- cov_usa_sp$STATE_CODE
+
+usa_car_mod_1 <- 
+  spaMM::fitme(death_per_10000 ~ 1 +
+           adjacency(1|STATE_CODE),
+                     adjMatrix = usa_adj_matrix,
+                     data = cov_usa_sp@data, 
+                     family = "poisson")
+
+summary(usa_car_mod_1)
+
+usa_car_mod_2 <- 
+  spaMM::fitme(death_per_10000 ~ diabetes_ratio +
+                    adjacency(1|STATE_CODE),
+                     adjMatrix = usa_adj_matrix,
+                     data = cov_usa_sp@data, 
+                     family = "poisson")
+
+summary(usa_car_mod_2)
+
+usa_car_mod_3 <- 
+  spaMM::fitme(death_per_10000 ~ diabetes_ratio,
+                     adjMatrix = usa_adj_matrix,
+                     data = cov_usa_sp@data, 
+                     family = "poisson")
+
+summary(usa_car_mod_3)
+
+# structure marginal AIC to print
+car_sans_coef <- t(as.data.frame(AIC(usa_car_mod_1)[1]))
+car_with_coef <- t(as.data.frame(AIC(usa_car_mod_2)[1]))
+model_sans_adj <- t(as.data.frame(AIC(usa_car_mod_3)))
+
+# bind and name AIC scores.
+aic_tab <- rbind(car_sans_coef, car_with_coef, model_sans_adj)
+row.names(aic_tab) <- c("a). CAR sans Disease Coefficient", 
+                        "b). CAR with Disease Coefficient", 
+                        "c). CAR sans Spatial Coefficient.")
+
+# print table
+kbl(aic_tab, col.names = "Marginal AIC") %>%  
+   kable_paper("hover", full_width = F)
+
+```
+
+
+```{r}
+
+# obtain confidence interval of CAR model with disease prevalence covariate.
+sp_terms <- c('diabetes_ratio')
+sp_coefs <- as.data.frame(summary(usa_car_mod_2)$beta_table)
+
+sp_row <- row.names(sp_coefs) %in% sp_terms
+sp_lower <- sp_coefs[sp_row,'Estimate'] - 1.96*sp_coefs[sp_row, 'Cond. SE']
+sp_upper <- sp_coefs[sp_row,'Estimate'] + 1.96*sp_coefs[sp_row, 'Cond. SE']
+
+data.frame(sp_terms = sp_terms,
+           IRR = sp_coefs[sp_row,'Estimate'],
+           sp_lower = sp_lower,
+           sp_upper = sp_upper)
+
+```
+
+```{r}
+# Scatter plot to evaluate fir of model.
+ggplot() + geom_point(aes(fitted(usa_car_mod_2), 
+                          cov_usa_sp$death_per_10000), color="#69b3a2") +
+  geom_smooth(aes(fitted(usa_car_mod_2), cov_usa_sp$death_per_10000), method = lm, col="red", fill="#69b3a2", se=TRUE)+
+  theme_ipsum() +
+  ylab("State Mortality Counts per 10,000") +
+  xlab("Fitted Values from CAR model")
+  
+```
+
+```{r, figures-side, fig.show="hold", out.width="50%"}
+
+# map spatial observed values and spatial fit
+cov_usa_sp$fitted_car_2 <- fitted(usa_car_mod_2)
+
+choroLayer(spdf = cov_usa_sp, 
+           df = cov_usa_sp@data, 
+           var = "death_per_10000",
+           legend.pos = 'bottomleft', legend.horiz = T, 
+           legend.title.txt = "Deaths per 10000 people")
+title("Observed Mortality Count")
+
+choroLayer(spdf = cov_usa_sp, 
+           df = cov_usa_sp@data, 
+           var = "fitted_car_2",
+           legend.pos = 'bottomleft', legend.horiz = T, 
+           legend.title.txt = "Deaths per 10000 people")
+title("Fitted CAR model")
+
+cov_usa_sp$std_dev_res <- usa_car_mod_2$std_dev_res
+
+cov_usa_df <- as.data.frame(cov_usa_sp)
+
+# histogram of fitted residuals.
+ggplot(cov_usa_df, aes(std_dev_res)) +
+  geom_histogram(bins = 20, fill = "steelblue", alpha = .7) +
+  xlim(-10, 10) +
+   theme_ipsum() + ggtitle("CAR Model - Standard Deviation of Residual Values") +
+  ylab("Count") + xlab("Standard Deviations")
+
+# map residuals?!?
+choroLayer(spdf = cov_usa_sp, 
+           df = cov_usa_sp@data, 
+           var = "std_dev_res",
+           legend.pos = 'bottomleft', legend.horiz = T, 
+           legend.title.txt = "Standard Deviation")
+title("CAR model Residuals")
+
+```
+
+```{r}
+# global moran's eye on fitted residuals. 
+moran.test(cov_usa_sp$std_dev_res, listw = cov_usa_w)
+
+```
+
+~fin
+
+
+
+
